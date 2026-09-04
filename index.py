@@ -5,6 +5,7 @@ from dotenv import load_dotenv
 import os
 import sqlite3
 import time
+import datetime
 
 # ---------- 기본 설정 ----------
 dotenv_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), '.env')
@@ -175,10 +176,13 @@ async def refresh_bet_message(bet_id, view=None):
             pass
 
 class BetModal(discord.ui.Modal):
-    def __init__(self, bet_id, choice, choice_label):
-        super().__init__(title=f"'{choice_label}'에 배팅하기")
+    def __init__(self, bet_id, choice, option_a_label, option_b_label):
+        label = option_a_label if choice == "a" else option_b_label
+        super().__init__(title=f"'{label}'에 배팅하기")
         self.bet_id = bet_id
         self.choice = choice
+        self.option_a_label = option_a_label
+        self.option_b_label = option_b_label
         self.amount_input = discord.ui.TextInput(label="배팅할 만두 수", placeholder="예: 50")
         self.add_item(self.amount_input)
 
@@ -228,15 +232,11 @@ class BetView(discord.ui.View):
         btn_b = discord.ui.Button(label=option_b, style=discord.ButtonStyle.red, custom_id=f"pred_b_{bet_id}")
 
         async def on_a(interaction: discord.Interaction):
-            modal = BetModal(bet_id, "a", option_a)
-            modal.option_a_label = option_a
-            modal.option_b_label = option_b
+            modal = BetModal(bet_id, "a", option_a, option_b)
             await interaction.response.send_modal(modal)
 
         async def on_b(interaction: discord.Interaction):
-            modal = BetModal(bet_id, "b", option_b)
-            modal.option_a_label = option_a
-            modal.option_b_label = option_b
+            modal = BetModal(bet_id, "b", option_a, option_b)
             await interaction.response.send_modal(modal)
 
         btn_a.callback = on_a
@@ -245,11 +245,11 @@ class BetView(discord.ui.View):
         self.add_item(btn_b)
 
 async def close_betting_after_delay(bet_id):
-    await discord.utils.sleep_until(discord.utils.utcnow() + __import__("datetime").timedelta(seconds=BETTING_DURATION))
+    await discord.utils.sleep_until(discord.utils.utcnow() + datetime.timedelta(seconds=BETTING_DURATION))
     cur.execute("SELECT status FROM bets WHERE bet_id=?", (bet_id,))
     row = cur.fetchone()
     if row and row[0] == "open":
-        await refresh_bet_message(bet_id, view=None)  # 베팅 마감: 버튼 제거
+        await refresh_bet_message(bet_id, view=None)
 
 @bot.tree.command(name="승부예측생성", description="새로운 승부예측을 생성합니다 (베팅 3분 제한)")
 @app_commands.describe(제목="승부예측 제목", 성공옵션="성공 쪽 이름", 실패옵션="실패 쪽 이름")
@@ -277,10 +277,6 @@ async def 승부예측생성(interaction: discord.Interaction, 제목: str, 성�
     conn.commit()
 
     bot.loop.create_task(close_betting_after_delay(bet_id))
-
-@app_commands.command(name="_dummy")
-async def _dummy(interaction: discord.Interaction):
-    pass
 
 async def result_autocomplete(interaction: discord.Interaction, current: str):
     cur.execute("SELECT option_a, option_b FROM bets WHERE status='open'")
