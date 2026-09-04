@@ -257,9 +257,18 @@ async def close_betting_after_delay(bet_id):
     if row and row[0] == "open":
         await refresh_bet_message(bet_id, view=None)
 
-# ---------- 승부예측 생성 / 종료 (! 명령어, 전체 사용 가능) ----------
-@bot.command(name="승부예측생성")
-async def 승부예측생성(ctx, 제목: str, 성공옵션: str, 실패옵션: str):
+# ---------- 승부예측 생성 / 종료 (! 그룹 명령어, 띄어쓰기로 사용) ----------
+@bot.group(invoke_without_command=True)
+async def 승부예측(ctx):
+    await ctx.send(
+        '사용법:\n'
+        '`!승부예측 생성 "제목" "성공옵션" "실패옵션"`\n'
+        '`!승부예측 종료 결과`\n'
+        '`!승부예측 전체종료` (관리자 전용)'
+    )
+
+@승부예측.command(name="생성")
+async def 승부예측_생성(ctx, 제목: str, 성공옵션: str, 실패옵션: str):
     cur.execute("SELECT bet_id FROM bets WHERE status='open'")
     if cur.fetchone():
         await ctx.send("이미 진행 중인 승부예측이 있습니다. 먼저 종료해주세요.")
@@ -283,13 +292,13 @@ async def 승부예측생성(ctx, 제목: str, 성공옵션: str, 실패옵션: 
 
     bot.loop.create_task(close_betting_after_delay(bet_id))
 
-@승부예측생성.error
-async def 승부예측생성_error(ctx, error):
+@승부예측_생성.error
+async def 승부예측_생성_error(ctx, error):
     if isinstance(error, (commands.BadArgument, commands.MissingRequiredArgument)):
-        await ctx.send('사용법: `!승부예측생성 "제목" "성공옵션" "실패옵션"` (띄어쓰기가 있으면 큰따옴표로 감싸주세요)')
+        await ctx.send('사용법: `!승부예측 생성 "제목" "성공옵션" "실패옵션"` (띄어쓰기가 있으면 큰따옴표로 감싸주세요)')
 
-@bot.command(name="승부예측종료")
-async def 승부예측종료(ctx, *, 결과: str):
+@승부예측.command(name="종료")
+async def 승부예측_종료(ctx, *, 결과: str):
     cur.execute("SELECT bet_id, title, option_a, option_b FROM bets WHERE status='open'")
     row = cur.fetchone()
     if not row:
@@ -335,9 +344,9 @@ async def 승부예측종료(ctx, *, 결과: str):
     result_embed.add_field(name="배당 내역", value="\n".join(result_lines) if result_lines else "없음", inline=False)
     await ctx.send(embed=result_embed)
 
-@bot.command(name="승부예측전체종료")
+@승부예측.command(name="전체종료")
 @commands.has_permissions(administrator=True)
-async def 승부예측전체종료(ctx):
+async def 승부예측_전체종료(ctx):
     cur.execute("SELECT bet_id, title FROM bets WHERE status='open'")
     row = cur.fetchone()
     if not row:
@@ -356,8 +365,8 @@ async def 승부예측전체종료(ctx):
 
     await ctx.send(f"승부예측 '{title}'이(가) 취소되었습니다. 배팅했던 만두는 전액 환불되었습니다.")
 
-@승부예측전체종료.error
-async def 승부예측전체종료_error(ctx, error):
+@승부예측_전체종료.error
+async def 승부예측_전체종료_error(ctx, error):
     if isinstance(error, commands.MissingPermissions):
         await ctx.send("이 명령어는 관리자만 사용할 수 있습니다.")
 
