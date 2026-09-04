@@ -43,8 +43,16 @@ def add_points(user_id, amount):
     cur.execute("UPDATE points SET points = points + ? WHERE user_id=?", (amount, user_id))
     conn.commit()
 
+def get_rank(user_id):
+    cur.execute("SELECT user_id FROM points ORDER BY points DESC")
+    rows = cur.fetchall()
+    for i, (uid,) in enumerate(rows, start=1):
+        if uid == user_id:
+            return i, len(rows)
+    return None, len(rows)
+
 # ---------- 음성 채널 만두 지급 ----------
-voice_tracker = {}  # {user_id: 누적 초}
+voice_tracker = {}
 
 @tasks.loop(seconds=60)
 async def voice_point_task():
@@ -56,10 +64,9 @@ async def voice_point_task():
                 uid = member.id
                 voice_tracker[uid] = voice_tracker.get(uid, 0) + 60
                 elapsed = voice_tracker[uid]
-
-                if elapsed % 600 == 0:      # 10분마다
+                if elapsed % 600 == 0:
                     add_points(uid, 20)
-                if elapsed % 3600 == 0:     # 1시간마다 보너스
+                if elapsed % 3600 == 0:
                     add_points(uid, 10)
 
 @bot.event
@@ -69,30 +76,33 @@ async def on_voice_state_update(member, before, after):
     if after.channel is None:
         voice_tracker.pop(member.id, None)
 
-# ---------- 만두 명령어 ----------
-@bot.group(invoke_without_command=True)
-async def 만두(ctx):
-    await ctx.send("사용법: `!만두 확인` / `!만두 전체` / `!만두 지급 @사용자 개수` (관리자 전용)")
+# ---------- 만두 확인 / 전체 (슬래시 명령어 - 나만 보기) ----------
+@bot.tree.command(name="만두확인", description="내 만두 개수와 순위를 확인합니다 (나만 볼 수 있음)")
+async def 만두확인(interaction: discord.Interaction):
+    pts = get_points(interaction.user.id)
+    rank, total = get_rank(interaction.user.id)
+    msg = f"🥟 {interaction.user.mention}님의 만두: **{pts}개**\n순위: **{rank}위** / 총 {total}명"
+    await interaction.response.send_message(msg, ephemeral=True)
 
-@만두.command(name="확인")
-async def 만두_확인(ctx):
-    pts = get_points(ctx.author.id)
-    await ctx.send(f"{ctx.author.mention}님의 현재 만두: **{pts}개** 🥟")
-
-@만두.command(name="전체")
-async def 만두_전체(ctx):
-    cur.execute("SELECT user_id, points FROM points ORDER BY points DESC")
+@bot.tree.command(name="만두전체", description="만두 상위 10명을 확인합니다 (나만 볼 수 있음)")
+async def 만두전체(interaction: discord.Interaction):
+    cur.execute("SELECT user_id, points FROM points ORDER BY points DESC LIMIT 10")
     rows = cur.fetchall()
     if not rows:
-        await ctx.send("아직 기록된 만두가 없습니다.")
+        await interaction.response.send_message("아직 기록된 만두가 없습니다.", ephemeral=True)
         return
     lines = []
-    for i, (uid, pts) in enumerate(rows[:20], start=1):
-        member = ctx.guild.get_member(uid)
+    for i, (uid, pts) in enumerate(rows, start=1):
+        member = interaction.guild.get_member(uid)
         name = member.display_name if member else f"알 수 없음({uid})"
         lines.append(f"{i}. {name} - {pts}개")
-    embed = discord.Embed(title="🥟 전체 만두 순위", description="\n".join(lines), color=discord.Color.gold())
-    await ctx.send(embed=embed)
+    embed = discord.Embed(title="🥟 만두 상위 10위", description="\n".join(lines), color=discord.Color.gold())
+    await interaction.response.send_message(embed=embed, ephemeral=True)
+
+# ---------- 만두 지급 (관리자 전용, 텍스트 명령어 유지) ----------
+@bot.group(invoke_without_command=True)
+async def 만두(ctx):
+    await ctx.send("사용법: `/만두확인` / `/만두전체` / `!만두 지급 @사용자 개수` (관리자 전용)")
 
 @만두.command(name="지급")
 @commands.has_permissions(administrator=True)
@@ -105,9 +115,7 @@ async def 만두_지급(ctx, 대상: discord.Member, 개수: int):
 async def 만두_지급_error(ctx, error):
     if isinstance(error, commands.MissingPermissions):
         await ctx.send("이 명령어는 관리자만 사용할 수 있습니다.")
-    elif isinstance(error, commands.BadArgument):
-        await ctx.send("사용법: `!만두 지급 @사용자 개수` (예: `!만두 지급 @홍길동 50`)")
-    elif isinstance(error, commands.MissingRequiredArgument):
+    elif isinstance(error, (commands.BadArgument, commands.MissingRequiredArgument)):
         await ctx.send("사용법: `!만두 지급 @사용자 개수` (예: `!만두 지급 @홍길동 50`)")
 
 # ---------- 배팅 시스템 ----------
@@ -264,6 +272,12 @@ async def on_ready():
     row = cur.fetchone()
     if row:
         bot.add_view(BetView(row[0]))
+
+    try:
+        synced = await bot.tree.sync()
+        print(f"슬래시 명령어 {len(synced)}개 동기화 완료")
+    except Exception as e:
+        print(f"슬래시 명령어 동기화 실패: {e}")
 
     print(f"{bot.user} 봇이 온라인 상태입니다!")
 
