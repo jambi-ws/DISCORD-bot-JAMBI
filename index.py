@@ -1,6 +1,5 @@
 import discord
 from discord.ext import commands, tasks
-from discord import app_commands
 from dotenv import load_dotenv
 import os
 import sqlite3
@@ -90,7 +89,7 @@ async def on_voice_state_update(member, before, after):
     if after.channel is None:
         voice_tracker.pop(member.id, None)
 
-# ---------- 만두 확인 / 전체 / 지급 ----------
+# ---------- 만두 확인 / 전체 (슬래시 명령어 - 나만 보기 유지) ----------
 @bot.tree.command(name="만두확인", description="내 만두 개수와 순위를 확인합니다 (나만 볼 수 있음)")
 async def 만두확인(interaction: discord.Interaction):
     pts = get_points(interaction.user.id)
@@ -113,17 +112,24 @@ async def 만두전체(interaction: discord.Interaction):
     embed = discord.Embed(title="🥟 만두 상위 10위", description="\n".join(lines), color=discord.Color.gold())
     await interaction.response.send_message(embed=embed, ephemeral=True)
 
-@bot.tree.command(name="만두지급", description="[관리자] 특정 사용자에게 만두를 지급합니다")
-@app_commands.describe(대상="만두를 지급할 사용자", 개수="지급할 만두 개수")
-async def 만두지급(interaction: discord.Interaction, 대상: discord.Member, 개수: int):
-    if not interaction.user.guild_permissions.administrator:
-        await interaction.response.send_message("이 명령어는 관리자만 사용할 수 있습니다.", ephemeral=True)
-        return
+# ---------- 만두 지급 (! 명령어, 관리자 전용) ----------
+@bot.group(invoke_without_command=True)
+async def 만두(ctx):
+    await ctx.send("사용법: `!만두 지급 @사용자 개수` (관리자 전용)")
+
+@만두.command(name="지급")
+@commands.has_permissions(administrator=True)
+async def 만두_지급(ctx, 대상: discord.Member, 개수: int):
     add_points(대상.id, 개수)
     new_total = get_points(대상.id)
-    await interaction.response.send_message(
-        f"{대상.mention}님에게 만두 **{개수}개**를 지급했습니다. (현재 보유: {new_total}개) 🥟"
-    )
+    await ctx.send(f"{대상.mention}님에게 만두 **{개수}개**를 지급했습니다. (현재 보유: {new_total}개) 🥟")
+
+@만두_지급.error
+async def 만두_지급_error(ctx, error):
+    if isinstance(error, commands.MissingPermissions):
+        await ctx.send("이 명령어는 관리자만 사용할 수 있습니다.")
+    elif isinstance(error, (commands.BadArgument, commands.MissingRequiredArgument)):
+        await ctx.send("사용법: `!만두 지급 @사용자 개수` (예: `!만두 지급 @홍길동 50`)")
 
 # ---------- 승부예측 시스템 ----------
 async def get_bet_stats(bet_id):
@@ -251,18 +257,18 @@ async def close_betting_after_delay(bet_id):
     if row and row[0] == "open":
         await refresh_bet_message(bet_id, view=None)
 
-@bot.tree.command(name="승부예측생성", description="새로운 승부예측을 생성합니다 (베팅 3분 제한)")
-@app_commands.describe(제목="승부예측 제목", 성공옵션="성공 쪽 이름", 실패옵션="실패 쪽 이름")
-async def 승부예측생성(interaction: discord.Interaction, 제목: str, 성공옵션: str, 실패옵션: str):
+# ---------- 승부예측 생성 / 종료 (! 명령어, 전체 사용 가능) ----------
+@bot.command(name="승부예측생성")
+async def 승부예측생성(ctx, 제목: str, 성공옵션: str, 실패옵션: str):
     cur.execute("SELECT bet_id FROM bets WHERE status='open'")
     if cur.fetchone():
-        await interaction.response.send_message("이미 진행 중인 승부예측이 있습니다. 먼저 종료해주세요.", ephemeral=True)
+        await ctx.send("이미 진행 중인 승부예측이 있습니다. 먼저 종료해주세요.")
         return
 
     created_at = int(time.time())
     cur.execute(
         "INSERT INTO bets (title, option_a, option_b, status, channel_id, created_at) VALUES (?, ?, ?, 'open', ?, ?)",
-        (제목, 성공옵션, 실패옵션, interaction.channel_id, created_at)
+        (제목, 성공옵션, 실패옵션, ctx.channel.id, created_at)
     )
     conn.commit()
     bet_id = cur.lastrowid
@@ -271,33 +277,23 @@ async def 승부예측생성(interaction: discord.Interaction, 제목: str, 성�
     embed = build_bet_embed(제목, 성공옵션, 실패옵션, stats, "open", created_at)
     view = BetView(bet_id, 성공옵션, 실패옵션)
 
-    await interaction.response.send_message(embed=embed, view=view)
-    msg = await interaction.original_response()
+    msg = await ctx.send(embed=embed, view=view)
     cur.execute("UPDATE bets SET message_id=? WHERE bet_id=?", (msg.id, bet_id))
     conn.commit()
 
     bot.loop.create_task(close_betting_after_delay(bet_id))
 
-async def result_autocomplete(interaction: discord.Interaction, current: str):
-    cur.execute("SELECT option_a, option_b FROM bets WHERE status='open'")
-    row = cur.fetchone()
-    if not row:
-        return []
-    option_a, option_b = row
-    choices = [option_a, option_b]
-    return [
-        app_commands.Choice(name=c, value=c)
-        for c in choices if current.lower() in c.lower()
-    ][:25]
+@승부예측생성.error
+async def 승부예측생성_error(ctx, error):
+    if isinstance(error, (commands.BadArgument, commands.MissingRequiredArgument)):
+        await ctx.send('사용법: `!승부예측생성 "제목" "성공옵션" "실패옵션"` (띄어쓰기가 있으면 큰따옴표로 감싸주세요)')
 
-@bot.tree.command(name="승부예측종료", description="진행 중인 승부예측의 결과를 발표하고 마감합니다")
-@app_commands.describe(결과="승리한 쪽의 이름을 선택하세요")
-@app_commands.autocomplete(결과=result_autocomplete)
-async def 승부예측종료(interaction: discord.Interaction, 결과: str):
+@bot.command(name="승부예측종료")
+async def 승부예측종료(ctx, *, 결과: str):
     cur.execute("SELECT bet_id, title, option_a, option_b FROM bets WHERE status='open'")
     row = cur.fetchone()
     if not row:
-        await interaction.response.send_message("진행 중인 승부예측이 없습니다.", ephemeral=True)
+        await ctx.send("진행 중인 승부예측이 없습니다.")
         return
     bet_id, title, option_a, option_b = row
 
@@ -306,7 +302,7 @@ async def 승부예측종료(interaction: discord.Interaction, 결과: str):
     elif 결과 == option_b:
         win_choice, lose_choice, win_status = "b", "a", "b"
     else:
-        await interaction.response.send_message(f"'{option_a}' 또는 '{option_b}' 중에서 선택해주세요.", ephemeral=True)
+        await ctx.send(f"'{option_a}' 또는 '{option_b}' 중에서 정확히 입력해주세요.")
         return
 
     cur.execute("SELECT user_id, amount FROM wagers WHERE bet_id=? AND choice=?", (bet_id, win_choice))
@@ -327,7 +323,7 @@ async def 승부예측종료(interaction: discord.Interaction, 결과: str):
             share = int(total_lose_pool * (amt / total_win_pool))
             payout = amt + share
             add_points(uid, payout)
-            member = interaction.guild.get_member(uid)
+            member = ctx.guild.get_member(uid)
             name = member.display_name if member else str(uid)
             result_lines.append(f"{name}: +{payout}개 (원금 {amt} + 배당 {share})")
 
@@ -337,18 +333,15 @@ async def 승부예측종료(interaction: discord.Interaction, 결과: str):
 
     result_embed = discord.Embed(title=f"🎉 승부예측 종료: {title}", description=f"결과: **{결과}**", color=discord.Color.green())
     result_embed.add_field(name="배당 내역", value="\n".join(result_lines) if result_lines else "없음", inline=False)
-    await interaction.response.send_message(embed=result_embed)
+    await ctx.send(embed=result_embed)
 
-@bot.tree.command(name="승부예측전체종료", description="[관리자] 진행 중인 승부예측을 취소하고 전액 환불합니다")
-async def 승부예측전체종료(interaction: discord.Interaction):
-    if not interaction.user.guild_permissions.administrator:
-        await interaction.response.send_message("이 명령어는 관리자만 사용할 수 있습니다.", ephemeral=True)
-        return
-
+@bot.command(name="승부예측전체종료")
+@commands.has_permissions(administrator=True)
+async def 승부예측전체종료(ctx):
     cur.execute("SELECT bet_id, title FROM bets WHERE status='open'")
     row = cur.fetchone()
     if not row:
-        await interaction.response.send_message("진행 중인 승부예측이 없습니다.", ephemeral=True)
+        await ctx.send("진행 중인 승부예측이 없습니다.")
         return
     bet_id, title = row
 
@@ -361,7 +354,12 @@ async def 승부예측전체종료(interaction: discord.Interaction):
     conn.commit()
     await refresh_bet_message(bet_id, view=None)
 
-    await interaction.response.send_message(f"승부예측 '{title}'이(가) 취소되었습니다. 배팅했던 만두는 전액 환불되었습니다.")
+    await ctx.send(f"승부예측 '{title}'이(가) 취소되었습니다. 배팅했던 만두는 전액 환불되었습니다.")
+
+@승부예측전체종료.error
+async def 승부예측전체종료_error(ctx, error):
+    if isinstance(error, commands.MissingPermissions):
+        await ctx.send("이 명령어는 관리자만 사용할 수 있습니다.")
 
 # ---------- 봇 시작 ----------
 @bot.event
