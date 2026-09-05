@@ -24,15 +24,29 @@ conn = sqlite3.connect("points.db")
 cur = conn.cursor()
 cur.execute("""CREATE TABLE IF NOT EXISTS points (
     user_id INTEGER PRIMARY KEY, points INTEGER DEFAULT 0)""")
-cur.execute("""CREATE TABLE IF NOT EXISTS bets (
-    bet_id INTEGER PRIMARY KEY AUTOINCREMENT,
-    title TEXT,
-    option_a TEXT,
-    option_b TEXT,
-    status TEXT DEFAULT 'open',
-    channel_id INTEGER,
-    message_id INTEGER,
-    created_at INTEGER)""")
+
+# bets 테이블 구조 확인 및 마이그레이션
+cur.execute("PRAGMA table_info(bets)")
+existing_columns = [row[1] for row in cur.fetchall()]
+
+if not existing_columns:
+    cur.execute("""CREATE TABLE bets (
+        bet_id INTEGER PRIMARY KEY AUTOINCREMENT,
+        title TEXT,
+        option_a TEXT,
+        option_b TEXT,
+        status TEXT DEFAULT 'open',
+        channel_id INTEGER,
+        message_id INTEGER,
+        created_at INTEGER)""")
+else:
+    if "option_a" not in existing_columns:
+        cur.execute("ALTER TABLE bets ADD COLUMN option_a TEXT DEFAULT '성공'")
+    if "option_b" not in existing_columns:
+        cur.execute("ALTER TABLE bets ADD COLUMN option_b TEXT DEFAULT '실패'")
+    if "created_at" not in existing_columns:
+        cur.execute("ALTER TABLE bets ADD COLUMN created_at INTEGER DEFAULT 0")
+
 cur.execute("""CREATE TABLE IF NOT EXISTS wagers (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     bet_id INTEGER,
