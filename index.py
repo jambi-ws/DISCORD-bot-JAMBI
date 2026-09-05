@@ -5,6 +5,7 @@ import os
 import sqlite3
 import time
 import datetime
+import traceback
 
 # ---------- 기본 설정 ----------
 dotenv_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), '.env')
@@ -257,45 +258,74 @@ async def close_betting_after_delay(bet_id):
     if row and row[0] == "open":
         await refresh_bet_message(bet_id, view=None)
 
-# ---------- 승부예측 생성 / 종료 (! 그룹 명령어, 띄어쓰기로 사용) ----------
+# ---------- 승부예측 생성 / 종료 / 상태 ----------
 @bot.group(invoke_without_command=True)
 async def 승부예측(ctx):
     await ctx.send(
         '사용법:\n'
         '`!승부예측 생성 "제목" "성공옵션" "실패옵션"`\n'
         '`!승부예측 종료 결과`\n'
-        '`!승부예측 전체종료` (관리자 전용)'
+        '`!승부예측 전체종료` (관리자 전용)\n'
+        '`!승부예측 상태` (디버깅용: 현재 상태 확인)'
+    )
+
+@승부예측.command(name="상태")
+async def 승부예측_상태(ctx):
+    cur.execute("SELECT bet_id, title, option_a, option_b, status, created_at FROM bets ORDER BY bet_id DESC LIMIT 1")
+    row = cur.fetchone()
+    if not row:
+        await ctx.send("아직 생성된 승부예측 기록이 전혀 없습니다.")
+        return
+    bet_id, title, option_a, option_b, status, created_at = row
+    await ctx.send(
+        f"가장 최근 승부예측 정보:\n"
+        f"- ID: {bet_id}\n"
+        f"- 제목: {title}\n"
+        f"- 옵션: {option_a} / {option_b}\n"
+        f"- 상태: {status}\n"
+        f"- 생성 시각(유닉스): {created_at}"
     )
 
 @승부예측.command(name="생성")
 async def 승부예측_생성(ctx, 제목: str, 성공옵션: str, 실패옵션: str):
-    cur.execute("SELECT bet_id FROM bets WHERE status='open'")
-    if cur.fetchone():
-        await ctx.send("이미 진행 중인 승부예측이 있습니다. 먼저 종료해주세요.")
-        return
+    try:
+        cur.execute("SELECT bet_id, title, status FROM bets WHERE status='open'")
+        existing = cur.fetchone()
+        if existing:
+            await ctx.send(f"이미 진행 중인 승부예측이 있습니다 (ID: {existing[0]}, 제목: {existing[1]}). 먼저 `!승부예측 종료` 또는 `!승부예측 전체종료`로 마무리해주세요.")
+            return
 
-    created_at = int(time.time())
-    cur.execute(
-        "INSERT INTO bets (title, option_a, option_b, status, channel_id, created_at) VALUES (?, ?, ?, 'open', ?, ?)",
-        (제목, 성공옵션, 실패옵션, ctx.channel.id, created_at)
-    )
-    conn.commit()
-    bet_id = cur.lastrowid
+        created_at = int(time.time())
+        cur.execute(
+            "INSERT INTO bets (title, option_a, option_b, status, channel_id, created_at) VALUES (?, ?, ?, 'open', ?, ?)",
+            (제목, 성공옵션, 실패옵션, ctx.channel.id, created_at)
+        )
+        conn.commit()
+        bet_id = cur.lastrowid
 
-    stats = {"a": {"count": 0, "total": 0}, "b": {"count": 0, "total": 0}}
-    embed = build_bet_embed(제목, 성공옵션, 실패옵션, stats, "open", created_at)
-    view = BetView(bet_id, 성공옵션, 실패옵션)
+        stats = {"a": {"count": 0, "total": 0}, "b": {"count": 0, "total": 0}}
+        embed = build_bet_embed(제목, 성공옵션, 실패옵션, stats, "open", created_at)
+        view = BetView(bet_id, 성공옵션, 실패옵션)
 
-    msg = await ctx.send(embed=embed, view=view)
-    cur.execute("UPDATE bets SET message_id=? WHERE bet_id=?", (msg.id, bet_id))
-    conn.commit()
+        msg = await ctx.send(embed=embed, view=view)
+        cur.execute("UPDATE bets SET message_id=? WHERE bet_id=?", (msg.id, bet_id))
+        conn.commit()
 
-    bot.loop.create_task(close_betting_after_delay(bet_id))
+        bot.loop.create_task(close_betting_after_delay(bet_id))
+        print(f"[승부예측 생성 성공] ID={bet_id}, 제목={제목}")
+    except Exception as e:
+        error_text = traceback.format_exc()
+        print(f"[승부예측 생성 오류]\n{error_text}")
+        await ctx.send(f"⚠️ 승부예측 생성 중 오류가 발생했습니다:\n```{str(e)}```")
 
 @승부예측_생성.error
 async def 승부예측_생성_error(ctx, error):
     if isinstance(error, (commands.BadArgument, commands.MissingRequiredArgument)):
-        await ctx.send('사용법: `!승부예측 생성 "제목" "성공옵션" "실패옵션"` (띄어쓰기가 있으면 큰따옴표로 감싸주세요)')
+        await ctx.send('사용법: `!승부예측 생성 "제목" "성공옵션" "실패옵션"` (띄어쓰기가 있으면 큰따옴표로 감싸주세요)\n예: `!승부예측 생성 테스트 성공 실패`')
+    else:
+        error_text = "".join(traceback.format_exception(type(error), error, error.__traceback__))
+        print(f"[승부예측 생성 명령어 오류]\n{error_text}")
+        await ctx.send(f"⚠️ 오류가 발생했습니다:\n```{str(error)}```")
 
 @승부예측.command(name="종료")
 async def 승부예측_종료(ctx, *, 결과: str):
