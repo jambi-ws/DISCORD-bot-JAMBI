@@ -6,9 +6,10 @@ import sqlite3
 import time
 import datetime
 import traceback
+import re
 
 # ---------- 버전 정보 ----------
-BOT_VERSION = "1.1.0"
+BOT_VERSION = "1.3.0"
 
 # ---------- 기본 설정 ----------
 dotenv_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), '.env')
@@ -61,6 +62,17 @@ cur.execute("""CREATE TABLE IF NOT EXISTS wagers (
     user_id INTEGER,
     choice TEXT,
     amount INTEGER)""")
+
+cur.execute("""CREATE TABLE IF NOT EXISTS temp_changes (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    change_type TEXT,
+    guild_id INTEGER,
+    target_user_id INTEGER,
+    original_name TEXT,
+    original_icon BLOB,
+    original_nick TEXT,
+    had_nick INTEGER,
+    expires_at INTEGER)""")
 conn.commit()
 
 DURATION_OPTIONS = [
@@ -69,6 +81,12 @@ DURATION_OPTIONS = [
     ("1분", 60),
     ("3분", 180),
 ]
+
+# ---------- 만두집 상점 설정 ----------
+TEXT_HIGHLIGHT_COST = 100
+SERVER_DECOR_COST = 2000
+NICKNAME_CHANGE_COST = 800
+TEMP_CHANGE_DURATION = 86400  # 24시간
 
 def get_points(user_id):
     cur.execute("SELECT points FROM points WHERE user_id=?", (user_id,))
@@ -164,7 +182,264 @@ async def 만두_지급_error(ctx, error):
     elif isinstance(error, (commands.BadArgument, commands.MissingRequiredArgument)):
         await ctx.send("사용법: `!만두 지급 @사용자 개수` (예: `!만두 지급 @홍길동 50`)")
 
-# ---------- 승부예측 시스템 ----------
+# ================= 만두집 상점 =================
+
+def schedule_temp_change_revert(change_id, expires_at):
+    async def revert_task():
+        delay = expires_at - int(time.time())
+        if delay > 0:
+            await discord.utils.sleep_until(discord.utils.utcnow() + datetime.timedelta(seconds=delay))
+        await apply_revert(change_id)
+    bot.loop.create_task(revert_task())
+
+async def apply_revert(change_id):
+    cur.execute("SELECT change_type, guild_id, target_user_id, original_name, original_icon, original_nick, had_nick FROM temp_changes WHERE id=?", (change_id,))
+    row = cur.fetchone()
+    if not row:
+        return
+    change_type, guild_id, target_user_id, original_name, original_icon, original_nick, had_nick = row
+
+    guild = bot.get_guild(guild_id)
+    if guild is None:
+        cur.execute("DELETE FROM temp_changes WHERE id=?", (change_id,))
+        conn.commit()
+        return
+
+    try:
+        if change_type == "server":
+            await guild.edit(name=original_name, icon=original_icon, reason="만두집: 서버 프로필 꾸미기 기간 만료 - 원상복구")
+        elif change_type == "nickname":
+            member = guild.get_member(target_user_id)
+            if member:
+                restore_nick = original_nick if had_nick else None
+                await member.edit(nick=restore_nick, reason="만두집: 닉네임 교체권 기간 만료 - 원상복구")
+    except discord.HTTPException as e:
+        print(f"[만두집 복구 실패] change_id={change_id}, error={e}")
+
+    cur.execute("DELETE FROM temp_changes WHERE id=?", (change_id,))
+    conn.commit()
+
+def restore_pending_temp_changes():
+    cur.execute("SELECT id, expires_at FROM temp_changes")
+    rows = cur.fetchall()
+    now = int(time.time())
+    for change_id, expires_at in rows:
+        if expires_at <= now:
+            bot.loop.create_task(apply_revert(change_id))
+        else:
+            schedule_temp_change_revert(change_id, expires_at)
+
+# ---------- /만두집 메인 메뉴 ----------
+class ShopMainView(discord.ui.View):
+    def __init__(self):
+        super().__init__(timeout=180)
+
+    @discord.ui.button(label=f"✨ 텍스트 강조 ({TEXT_HIGHLIGHT_COST}개)", style=discord.ButtonStyle.blurple)
+    async def highlight_btn(self, interaction: discord.Interaction, button: discord.ui.Button):
+        pts = get_points(interaction.user.id)
+        if pts < TEXT_HIGHLIGHT_COST:
+            await interaction.response.send_message(f"만두가 부족합니다. (필요: {TEXT_HIGHLIGHT_COST}개 / 보유: {pts}개)", ephemeral=True)
+            return
+        await interaction.response.send_modal(HighlightModal())
+
+    @discord.ui.button(label=f"🖼️ 서버 프로필 꾸미기 ({SERVER_DECOR_COST}개)", style=discord.ButtonStyle.blurple)
+    async def server_decor_btn(self, interaction: discord.Interaction, button: discord.ui.Button):
+        pts = get_points(interaction.user.id)
+        if pts < SERVER_DECOR_COST:
+            await interaction.response.send_message(f"만두가 부족합니다. (필요: {SERVER_DECOR_COST}개 / 보유: {pts}개)", ephemeral=True)
+            return
+        if not interaction.guild.me.guild_permissions.manage_guild:
+            await interaction.response.send_message("⚠️ 봇에게 '서버 관리' 권한이 없어서 사용할 수 없습니다. 관리자에게 문의해주세요.", ephemeral=True)
+            return
+        await interaction.response.send_modal(ServerDecorModal())
+
+    @discord.ui.button(label=f"🏷️ 타인 닉네임 1일 교체권 ({NICKNAME_CHANGE_COST}개)", style=discord.ButtonStyle.blurple)
+    async def nickname_btn(self, interaction: discord.Interaction, button: discord.ui.Button):
+        pts = get_points(interaction.user.id)
+        if pts < NICKNAME_CHANGE_COST:
+            await interaction.response.send_message(f"만두가 부족합니다. (필요: {NICKNAME_CHANGE_COST}개 / 보유: {pts}개)", ephemeral=True)
+            return
+        if not interaction.guild.me.guild_permissions.manage_nicknames:
+            await interaction.response.send_message("⚠️ 봇에게 '닉네임 관리' 권한이 없어서 사용할 수 없습니다. 관리자에게 문의해주세요.", ephemeral=True)
+            return
+        await interaction.response.send_modal(NicknameChangeModal())
+
+@bot.tree.command(name="만두집", description="만두로 할 수 있는 것들을 확인합니다 (나만 볼 수 있음)")
+async def 만두집(interaction: discord.Interaction):
+    pts = get_points(interaction.user.id)
+    embed = discord.Embed(
+        title="🥟 만두집 상점",
+        description=f"현재 보유 만두: **{pts}개**\n\n아래 버튼을 눌러 만두를 사용해보세요!",
+        color=discord.Color.orange()
+    )
+    embed.add_field(name="✨ 텍스트 강조", value=f"{TEXT_HIGHLIGHT_COST}개 · 원하는 문구를 화려하게 강조해서 채팅에 게시", inline=False)
+    embed.add_field(name="🖼️ 서버 프로필 꾸미기", value=f"{SERVER_DECOR_COST}개 · 24시간 동안 서버 이름/아이콘 변경 (이후 자동 복구)", inline=False)
+    embed.add_field(name="🏷️ 타인 닉네임 1일 교체권", value=f"{NICKNAME_CHANGE_COST}개 · 상대 닉네임을 24시간 동안 변경 (이후 자동 복구)", inline=False)
+    await interaction.response.send_message(embed=embed, view=ShopMainView(), ephemeral=True)
+
+# ---------- 1. 텍스트 강조 ----------
+class HighlightModal(discord.ui.Modal, title="✨ 텍스트 강조"):
+    text_input = discord.ui.TextInput(
+        label="강조하고 싶은 문구를 입력하세요",
+        placeholder="예: 오늘 방송 대박!",
+        max_length=100,
+        style=discord.TextStyle.paragraph
+    )
+
+    async def on_submit(self, interaction: discord.Interaction):
+        pts = get_points(interaction.user.id)
+        if pts < TEXT_HIGHLIGHT_COST:
+            await interaction.response.send_message(f"만두가 부족합니다. (필요: {TEXT_HIGHLIGHT_COST}개 / 보유: {pts}개)", ephemeral=True)
+            return
+
+        add_points(interaction.user.id, -TEXT_HIGHLIGHT_COST)
+
+        text = self.text_input.value
+        embed = discord.Embed(
+            description=f"# 🌟 {text} 🌟",
+            color=discord.Color.gold()
+        )
+        embed.set_author(name=f"{interaction.user.display_name}님의 강조 메시지", icon_url=interaction.user.display_avatar.url)
+        embed.set_footer(text="✨ 만두 " + str(TEXT_HIGHLIGHT_COST) + "개로 강조된 메시지입니다 ✨")
+
+        await interaction.response.send_message("강조 메시지를 게시했습니다! 🎉", ephemeral=True)
+        await interaction.channel.send(content="🎉🎊✨━━━━━━━━━━━━━━━━━━━✨🎊🎉", embed=embed)
+
+# ---------- 2. 서버 프로필 꾸미기 ----------
+class ServerDecorModal(discord.ui.Modal, title="🖼️ 서버 프로필 꾸미기"):
+    new_name = discord.ui.TextInput(
+        label="새 서버 이름",
+        placeholder="예: 오늘은 만두데이",
+        max_length=100
+    )
+
+    async def on_submit(self, interaction: discord.Interaction):
+        await interaction.response.send_message(
+            f"좋습니다! 이제 **이 채널에 아이콘으로 쓸 이미지 파일을 첨부**해서 아무 메시지나 보내주세요. (2분 이내, 이미지 하나만)",
+            ephemeral=True
+        )
+
+        def check(m):
+            return m.author.id == interaction.user.id and m.channel.id == interaction.channel_id and len(m.attachments) > 0
+
+        try:
+            msg = await bot.wait_for("message", check=check, timeout=120)
+        except Exception:
+            await interaction.followup.send("⏰ 시간이 초과되어 취소되었습니다. 만두는 차감되지 않았습니다.", ephemeral=True)
+            return
+
+        attachment = msg.attachments[0]
+        if not attachment.content_type or "image" not in attachment.content_type:
+            await interaction.followup.send("이미지 파일이 아닙니다. 처음부터 다시 시도해주세요. 만두는 차감되지 않았습니다.", ephemeral=True)
+            return
+
+        pts = get_points(interaction.user.id)
+        if pts < SERVER_DECOR_COST:
+            await interaction.followup.send(f"만두가 부족합니다. (필요: {SERVER_DECOR_COST}개 / 보유: {pts}개)", ephemeral=True)
+            return
+
+        guild = interaction.guild
+        try:
+            original_icon_bytes = await guild.icon.read() if guild.icon else None
+        except Exception:
+            original_icon_bytes = None
+        original_name = guild.name
+
+        new_icon_bytes = await attachment.read()
+
+        try:
+            await guild.edit(name=self.new_name.value, icon=new_icon_bytes, reason=f"{interaction.user}님이 만두집 - 서버 프로필 꾸미기 사용")
+        except discord.HTTPException as e:
+            await interaction.followup.send(f"⚠️ 서버 프로필 변경에 실패했습니다: {e}", ephemeral=True)
+            return
+
+        add_points(interaction.user.id, -SERVER_DECOR_COST)
+        expires_at = int(time.time()) + TEMP_CHANGE_DURATION
+
+        cur.execute(
+            "INSERT INTO temp_changes (change_type, guild_id, target_user_id, original_name, original_icon, expires_at) VALUES (?, ?, ?, ?, ?, ?)",
+            ("server", guild.id, None, original_name, original_icon_bytes, expires_at)
+        )
+        conn.commit()
+        change_id = cur.lastrowid
+        schedule_temp_change_revert(change_id, expires_at)
+
+        try:
+            await msg.delete()
+        except discord.HTTPException:
+            pass
+
+        await interaction.followup.send(
+            f"✅ 서버 프로필이 변경되었습니다! 24시간 후 자동으로 원래대로 복구됩니다.",
+            ephemeral=True
+        )
+        await interaction.channel.send(f"🖼️ {interaction.user.mention}님이 만두 {SERVER_DECOR_COST}개로 서버 프로필을 하루 동안 꾸몄습니다!")
+
+# ---------- 3. 타인 닉네임 1일 교체권 ----------
+class NicknameChangeModal(discord.ui.Modal, title="🏷️ 타인 닉네임 1일 교체권"):
+    target_input = discord.ui.TextInput(
+        label="대상 (@멘션 또는 사용자 ID)",
+        placeholder="예: @홍길동 또는 123456789012345678"
+    )
+    new_nick_input = discord.ui.TextInput(
+        label="바꿀 닉네임",
+        placeholder="예: 오늘의 주인공",
+        max_length=32
+    )
+
+    async def on_submit(self, interaction: discord.Interaction):
+        pts = get_points(interaction.user.id)
+        if pts < NICKNAME_CHANGE_COST:
+            await interaction.response.send_message(f"만두가 부족합니다. (필요: {NICKNAME_CHANGE_COST}개 / 보유: {pts}개)", ephemeral=True)
+            return
+
+        raw = self.target_input.value.strip()
+        match = re.search(r"(\d{15,20})", raw)
+        if not match:
+            await interaction.response.send_message("대상을 인식할 수 없습니다. @멘션 또는 숫자로 된 사용자 ID를 입력해주세요.", ephemeral=True)
+            return
+
+        target_id = int(match.group(1))
+        target = interaction.guild.get_member(target_id)
+        if target is None:
+            await interaction.response.send_message("해당 사용자를 서버에서 찾을 수 없습니다.", ephemeral=True)
+            return
+
+        if target.id == interaction.guild.owner_id:
+            await interaction.response.send_message("서버 소유자의 닉네임은 변경할 수 없습니다.", ephemeral=True)
+            return
+
+        if target.top_role >= interaction.guild.me.top_role:
+            await interaction.response.send_message("봇보다 역할이 높거나 같은 사용자의 닉네임은 변경할 수 없습니다.", ephemeral=True)
+            return
+
+        original_nick = target.nick
+        had_nick = 1 if original_nick is not None else 0
+
+        try:
+            await target.edit(nick=self.new_nick_input.value, reason=f"{interaction.user}님이 만두집 - 닉네임 교체권 사용")
+        except discord.HTTPException as e:
+            await interaction.response.send_message(f"⚠️ 닉네임 변경에 실패했습니다: {e}", ephemeral=True)
+            return
+
+        add_points(interaction.user.id, -NICKNAME_CHANGE_COST)
+        expires_at = int(time.time()) + TEMP_CHANGE_DURATION
+
+        cur.execute(
+            "INSERT INTO temp_changes (change_type, guild_id, target_user_id, original_nick, had_nick, expires_at) VALUES (?, ?, ?, ?, ?, ?)",
+            ("nickname", interaction.guild.id, target.id, original_nick, had_nick, expires_at)
+        )
+        conn.commit()
+        change_id = cur.lastrowid
+        schedule_temp_change_revert(change_id, expires_at)
+
+        await interaction.response.send_message(
+            f"✅ {target.mention}님의 닉네임을 **'{self.new_nick_input.value}'**(으)로 변경했습니다! 24시간 후 자동으로 원래대로 복구됩니다.",
+            ephemeral=True
+        )
+        await interaction.channel.send(f"🏷️ {interaction.user.mention}님이 만두 {NICKNAME_CHANGE_COST}개로 {target.mention}님의 닉네임을 하루 동안 바꿨습니다!")
+
+# ================= 승부예측 시스템 =================
 async def get_bet_stats(bet_id):
     cur.execute("SELECT choice, COUNT(*), SUM(amount) FROM wagers WHERE bet_id=? GROUP BY choice", (bet_id,))
     stats = {"a": {"count": 0, "total": 0}, "b": {"count": 0, "total": 0}}
@@ -255,7 +530,6 @@ class BetModal(discord.ui.Modal):
             await interaction.response.send_message(f"만두가 부족합니다. (보유: {user_points}개)", ephemeral=True)
             return
 
-        # 기존 배팅 내역 확인
         cur.execute("SELECT choice, amount FROM wagers WHERE bet_id=? AND user_id=?", (self.bet_id, interaction.user.id))
         existing = cur.fetchone()
 
@@ -268,7 +542,6 @@ class BetModal(discord.ui.Modal):
                     ephemeral=True
                 )
                 return
-            # 같은 옵션 → 추가 배팅 (합산)
             add_points(interaction.user.id, -amount)
             cur.execute("UPDATE wagers SET amount = amount + ? WHERE bet_id=? AND user_id=?", (amount, self.bet_id, interaction.user.id))
             conn.commit()
@@ -325,7 +598,6 @@ async def close_betting_after_delay(bet_id, duration_seconds):
     if row and row[0] == "open":
         await refresh_bet_message(bet_id, view=None)
 
-# ---------- 승부예측 생성: 제한시간 선택 화면 ----------
 class DurationSelectView(discord.ui.View):
     def __init__(self, creator_id, channel_id, title, option_a, option_b):
         super().__init__(timeout=60)
@@ -376,7 +648,6 @@ class DurationSelectView(discord.ui.View):
             btn.callback = callback
             self.add_item(btn)
 
-# ---------- 승부예측 생성 / 종료 / 상태 ----------
 @bot.group(invoke_without_command=True)
 async def 승부예측(ctx):
     await ctx.send(
@@ -529,6 +800,8 @@ async def on_ready():
         if remaining > 0:
             bot.add_view(BetView(bet_id, option_a, option_b))
             bot.loop.create_task(close_betting_after_delay(bet_id, duration_seconds))
+
+    restore_pending_temp_changes()
 
     try:
         synced = await bot.tree.sync()
