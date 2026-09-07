@@ -38,7 +38,8 @@ if not existing_columns:
         status TEXT DEFAULT 'open',
         channel_id INTEGER,
         message_id INTEGER,
-        created_at INTEGER)""")
+        created_at INTEGER,
+        creator_id INTEGER)""")
 else:
     if "option_a" not in existing_columns:
         cur.execute("ALTER TABLE bets ADD COLUMN option_a TEXT DEFAULT '성공'")
@@ -46,6 +47,8 @@ else:
         cur.execute("ALTER TABLE bets ADD COLUMN option_b TEXT DEFAULT '실패'")
     if "created_at" not in existing_columns:
         cur.execute("ALTER TABLE bets ADD COLUMN created_at INTEGER DEFAULT 0")
+    if "creator_id" not in existing_columns:
+        cur.execute("ALTER TABLE bets ADD COLUMN creator_id INTEGER DEFAULT 0")
 
 cur.execute("""CREATE TABLE IF NOT EXISTS wagers (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -197,14 +200,17 @@ async def refresh_bet_message(bet_id, view=None):
             pass
 
 class BetModal(discord.ui.Modal):
-    def __init__(self, bet_id, choice, option_a_label, option_b_label):
+    def __init__(self, bet_id, choice, option_a_label, option_b_label, current_points):
         label = option_a_label if choice == "a" else option_b_label
         super().__init__(title=f"'{label}'에 배팅하기")
         self.bet_id = bet_id
         self.choice = choice
         self.option_a_label = option_a_label
         self.option_b_label = option_b_label
-        self.amount_input = discord.ui.TextInput(label="배팅할 만두 수", placeholder="예: 50")
+        self.amount_input = discord.ui.TextInput(
+            label=f"배팅할 만두 수 (보유: {current_points}개)",
+            placeholder="예: 50"
+        )
         self.add_item(self.amount_input)
 
     async def on_submit(self, interaction: discord.Interaction):
@@ -253,11 +259,13 @@ class BetView(discord.ui.View):
         btn_b = discord.ui.Button(label=option_b, style=discord.ButtonStyle.red, custom_id=f"pred_b_{bet_id}")
 
         async def on_a(interaction: discord.Interaction):
-            modal = BetModal(bet_id, "a", option_a, option_b)
+            current_points = get_points(interaction.user.id)
+            modal = BetModal(bet_id, "a", option_a, option_b, current_points)
             await interaction.response.send_modal(modal)
 
         async def on_b(interaction: discord.Interaction):
-            modal = BetModal(bet_id, "b", option_a, option_b)
+            current_points = get_points(interaction.user.id)
+            modal = BetModal(bet_id, "b", option_a, option_b, current_points)
             await interaction.response.send_modal(modal)
 
         btn_a.callback = on_a
@@ -278,25 +286,28 @@ async def 승부예측(ctx):
     await ctx.send(
         '사용법:\n'
         '`!승부예측 생성 "제목" "성공옵션" "실패옵션"`\n'
-        '`!승부예측 종료 결과`\n'
-        '`!승부예측 전체종료` (관리자 전용)\n'
+        '`!승부예측 종료 결과` (생성한 본인만 가능)\n'
+        '`!승부예측 전체종료` (관리자 전용, 누가 만들었든 취소 가능)\n'
         '`!승부예측 상태` (디버깅용: 현재 상태 확인)'
     )
 
 @승부예측.command(name="상태")
 async def 승부예측_상태(ctx):
-    cur.execute("SELECT bet_id, title, option_a, option_b, status, created_at FROM bets ORDER BY bet_id DESC LIMIT 1")
+    cur.execute("SELECT bet_id, title, option_a, option_b, status, created_at, creator_id FROM bets ORDER BY bet_id DESC LIMIT 1")
     row = cur.fetchone()
     if not row:
         await ctx.send("아직 생성된 승부예측 기록이 전혀 없습니다.")
         return
-    bet_id, title, option_a, option_b, status, created_at = row
+    bet_id, title, option_a, option_b, status, created_at, creator_id = row
+    creator = ctx.guild.get_member(creator_id)
+    creator_name = creator.display_name if creator else str(creator_id)
     await ctx.send(
         f"가장 최근 승부예측 정보:\n"
         f"- ID: {bet_id}\n"
         f"- 제목: {title}\n"
         f"- 옵션: {option_a} / {option_b}\n"
         f"- 상태: {status}\n"
+        f"- 생성자: {creator_name}\n"
         f"- 생성 시각(유닉스): {created_at}"
     )
 
@@ -306,13 +317,13 @@ async def 승부예측_생성(ctx, 제목: str, 성공옵션: str, 실패옵션:
         cur.execute("SELECT bet_id, title, status FROM bets WHERE status='open'")
         existing = cur.fetchone()
         if existing:
-            await ctx.send(f"이미 진행 중인 승부예측이 있습니다 (ID: {existing[0]}, 제목: {existing[1]}). 먼저 `!승부예측 종료` 또는 `!승부예측 전체종료`로 마무리해주세요.")
+            await ctx.send(f"이미 진행 중인 승부예측이 있습니다 (ID: {existing[0]}, 제목: {existing[1]}). 먼저 종료해주세요.")
             return
 
         created_at = int(time.time())
         cur.execute(
-            "INSERT INTO bets (title, option_a, option_b, status, channel_id, created_at) VALUES (?, ?, ?, 'open', ?, ?)",
-            (제목, 성공옵션, 실패옵션, ctx.channel.id, created_at)
+            "INSERT INTO bets (title, option_a, option_b, status, channel_id, created_at, creator_id) VALUES (?, ?, ?, 'open', ?, ?, ?)",
+            (제목, 성공옵션, 실패옵션, ctx.channel.id, created_at, ctx.author.id)
         )
         conn.commit()
         bet_id = cur.lastrowid
@@ -326,7 +337,7 @@ async def 승부예측_생성(ctx, 제목: str, 성공옵션: str, 실패옵션:
         conn.commit()
 
         bot.loop.create_task(close_betting_after_delay(bet_id))
-        print(f"[승부예측 생성 성공] ID={bet_id}, 제목={제목}")
+        print(f"[승부예측 생성 성공] ID={bet_id}, 제목={제목}, 생성자={ctx.author.id}")
     except Exception as e:
         error_text = traceback.format_exc()
         print(f"[승부예측 생성 오류]\n{error_text}")
@@ -343,12 +354,18 @@ async def 승부예측_생성_error(ctx, error):
 
 @승부예측.command(name="종료")
 async def 승부예측_종료(ctx, *, 결과: str):
-    cur.execute("SELECT bet_id, title, option_a, option_b FROM bets WHERE status='open'")
+    cur.execute("SELECT bet_id, title, option_a, option_b, creator_id FROM bets WHERE status='open'")
     row = cur.fetchone()
     if not row:
         await ctx.send("진행 중인 승부예측이 없습니다.")
         return
-    bet_id, title, option_a, option_b = row
+    bet_id, title, option_a, option_b, creator_id = row
+
+    if ctx.author.id != creator_id:
+        creator = ctx.guild.get_member(creator_id)
+        creator_name = creator.display_name if creator else "알 수 없음"
+        await ctx.send(f"이 승부예측은 **{creator_name}**님이 생성한 것이라 본인만 종료할 수 있습니다. (관리자는 `!승부예측 전체종료`로 취소 가능)")
+        return
 
     if 결과 == option_a:
         win_choice, lose_choice, win_status = "a", "b", "a"
