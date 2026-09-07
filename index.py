@@ -7,6 +7,9 @@ import time
 import datetime
 import traceback
 
+# ---------- 버전 정보 ----------
+BOT_VERSION = "1.0.0"
+
 # ---------- 기본 설정 ----------
 dotenv_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), '.env')
 load_dotenv(dotenv_path)
@@ -81,6 +84,11 @@ def get_rank(user_id):
         if uid == user_id:
             return i, len(rows)
     return None, len(rows)
+
+# ---------- 버전 확인 ----------
+@bot.command(name="버전확인")
+async def 버전확인(ctx):
+    await ctx.send(f"🤖 현재 봇 버전: **v{BOT_VERSION}**")
 
 # ---------- 음성 채널 만두 지급 ----------
 voice_tracker = {}
@@ -208,8 +216,9 @@ class BetModal(discord.ui.Modal):
         self.option_a_label = option_a_label
         self.option_b_label = option_b_label
         self.amount_input = discord.ui.TextInput(
-            label=f"배팅할 만두 수 (보유: {current_points}개)",
-            placeholder="예: 50"
+            label=f"배팅할 만두 수 (보유 {current_points}개)",
+            placeholder=f"현재 보유: {current_points}개 · 숫자만 입력",
+            max_length=10
         )
         self.add_item(self.amount_input)
 
@@ -452,7 +461,7 @@ async def on_ready():
     except Exception as e:
         print(f"슬래시 명령어 동기화 실패: {e}")
 
-    print(f"{bot.user} 봇이 온라인 상태입니다!")
+    print(f"{bot.user} 봇이 온라인 상태입니다! (버전 v{BOT_VERSION})")
 
 client = bot
 client.run(TOKEN)
