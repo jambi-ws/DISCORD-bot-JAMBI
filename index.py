@@ -6,10 +6,9 @@ import sqlite3
 import time
 import datetime
 import traceback
-import re
 
 # ---------- 버전 정보 ----------
-BOT_VERSION = "1.3.1"
+BOT_VERSION = "1.3.2"
 
 # ---------- 기본 설정 ----------
 dotenv_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), '.env')
@@ -86,7 +85,7 @@ DURATION_OPTIONS = [
 TEXT_HIGHLIGHT_COST = 100
 SERVER_DECOR_COST = 2000
 NICKNAME_CHANGE_COST = 800
-TEMP_CHANGE_DURATION = 60  # 1분 (테스트용, 원래는 86400=24시간)
+TEMP_CHANGE_DURATION = 60  # 테스트용 1분 (실사용 시 86400=24시간으로 변경)
 
 def get_points(user_id):
     cur.execute("SELECT points FROM points WHERE user_id=?", (user_id,))
@@ -262,7 +261,11 @@ class ShopMainView(discord.ui.View):
         if not interaction.guild.me.guild_permissions.manage_nicknames:
             await interaction.response.send_message("⚠️ 봇에게 '닉네임 관리' 권한이 없어서 사용할 수 없습니다. 관리자에게 문의해주세요.", ephemeral=True)
             return
-        await interaction.response.send_modal(NicknameChangeModal())
+        await interaction.response.send_message(
+            "닉네임을 바꿀 대상을 아래 목록에서 선택해주세요:",
+            view=NicknameTargetSelectView(),
+            ephemeral=True
+        )
 
 @bot.tree.command(name="만두집", description="만두로 할 수 있는 것들을 확인합니다 (나만 볼 수 있음)")
 async def 만두집(interaction: discord.Interaction):
@@ -375,17 +378,44 @@ class ServerDecorModal(discord.ui.Modal, title="🖼️ 서버 프로필 꾸미�
         )
         await interaction.channel.send(f"🖼️ {interaction.user.mention}님이 만두 {SERVER_DECOR_COST}개로 서버 프로필을 꾸몄습니다! ({TEMP_CHANGE_DURATION}초 후 복구)")
 
-# ---------- 3. 타인 닉네임 1일 교체권 ----------
-class NicknameChangeModal(discord.ui.Modal, title="🏷️ 타인 닉네임 1일 교체권"):
-    target_input = discord.ui.TextInput(
-        label="대상 (@멘션 또는 사용자 ID)",
-        placeholder="예: @홍길동 또는 123456789012345678"
-    )
+# ---------- 3. 타인 닉네임 1일 교체권 (유저 선택 드롭다운 방식) ----------
+class NicknameTargetSelectView(discord.ui.View):
+    def __init__(self):
+        super().__init__(timeout=60)
+
+    @discord.ui.select(cls=discord.ui.UserSelect, placeholder="닉네임을 바꿀 대상을 선택하세요", min_values=1, max_values=1)
+    async def select_target(self, interaction: discord.Interaction, select: discord.ui.UserSelect):
+        target = select.values[0]
+
+        if target.bot:
+            await interaction.response.send_message("봇의 닉네임은 변경할 수 없습니다.", ephemeral=True)
+            return
+
+        if target.id == interaction.guild.owner_id:
+            await interaction.response.send_message("서버 소유자의 닉네임은 변경할 수 없습니다.", ephemeral=True)
+            return
+
+        member = interaction.guild.get_member(target.id)
+        if member is None:
+            await interaction.response.send_message("해당 사용자를 서버에서 찾을 수 없습니다.", ephemeral=True)
+            return
+
+        if member.top_role >= interaction.guild.me.top_role:
+            await interaction.response.send_message("봇보다 역할이 높거나 같은 사용자의 닉네임은 변경할 수 없습니다.", ephemeral=True)
+            return
+
+        await interaction.response.send_modal(NicknameChangeModal(member))
+
+class NicknameChangeModal(discord.ui.Modal, title="🏷️ 새 닉네임 입력"):
     new_nick_input = discord.ui.TextInput(
         label="바꿀 닉네임",
         placeholder="예: 오늘의 주인공",
         max_length=32
     )
+
+    def __init__(self, target_member: discord.Member):
+        super().__init__()
+        self.target_member = target_member
 
     async def on_submit(self, interaction: discord.Interaction):
         pts = get_points(interaction.user.id)
@@ -393,26 +423,7 @@ class NicknameChangeModal(discord.ui.Modal, title="🏷️ 타인 닉네임 1일
             await interaction.response.send_message(f"만두가 부족합니다. (필요: {NICKNAME_CHANGE_COST}개 / 보유: {pts}개)", ephemeral=True)
             return
 
-        raw = self.target_input.value.strip()
-        match = re.search(r"(\d{15,20})", raw)
-        if not match:
-            await interaction.response.send_message("대상을 인식할 수 없습니다. @멘션 또는 숫자로 된 사용자 ID를 입력해주세요.", ephemeral=True)
-            return
-
-        target_id = int(match.group(1))
-        target = interaction.guild.get_member(target_id)
-        if target is None:
-            await interaction.response.send_message("해당 사용자를 서버에서 찾을 수 없습니다.", ephemeral=True)
-            return
-
-        if target.id == interaction.guild.owner_id:
-            await interaction.response.send_message("서버 소유자의 닉네임은 변경할 수 없습니다.", ephemeral=True)
-            return
-
-        if target.top_role >= interaction.guild.me.top_role:
-            await interaction.response.send_message("봇보다 역할이 높거나 같은 사용자의 닉네임은 변경할 수 없습니다.", ephemeral=True)
-            return
-
+        target = self.target_member
         original_nick = target.nick
         had_nick = 1 if original_nick is not None else 0
 
