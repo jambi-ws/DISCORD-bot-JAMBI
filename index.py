@@ -8,7 +8,7 @@ import datetime
 import traceback
 
 # ---------- 버전 정보 ----------
-BOT_VERSION = "1.3.2"
+BOT_VERSION = "1.4.0"
 
 # ---------- 기본 설정 ----------
 dotenv_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), '.env')
@@ -83,9 +83,10 @@ DURATION_OPTIONS = [
 
 # ---------- 만두집 상점 설정 ----------
 TEXT_HIGHLIGHT_COST = 100
-SERVER_DECOR_COST = 2000
-NICKNAME_CHANGE_COST = 800
-TEMP_CHANGE_DURATION = 60  # 테스트용 1분 (실사용 시 86400=24시간으로 변경)
+SERVER_DECOR_COST = 10000
+NICKNAME_CHANGE_COST = 4000
+TEMP_CHANGE_DURATION = 86400  # 24시간
+SHOP_MENU_TIMEOUT = 120  # 2분
 
 def get_points(user_id):
     cur.execute("SELECT points FROM points WHERE user_id=?", (user_id,))
@@ -231,7 +232,21 @@ def restore_pending_temp_changes():
 # ---------- /만두집 메인 메뉴 ----------
 class ShopMainView(discord.ui.View):
     def __init__(self):
-        super().__init__(timeout=180)
+        super().__init__(timeout=SHOP_MENU_TIMEOUT)
+        self.message = None
+
+    async def close_menu(self):
+        for item in self.children:
+            item.disabled = True
+        if self.message:
+            try:
+                await self.message.edit(view=self)
+            except discord.HTTPException:
+                pass
+        self.stop()
+
+    async def on_timeout(self):
+        await self.close_menu()
 
     @discord.ui.button(label=f"✨ 텍스트 강조 ({TEXT_HIGHLIGHT_COST}개)", style=discord.ButtonStyle.blurple)
     async def highlight_btn(self, interaction: discord.Interaction, button: discord.ui.Button):
@@ -240,6 +255,7 @@ class ShopMainView(discord.ui.View):
             await interaction.response.send_message(f"만두가 부족합니다. (필요: {TEXT_HIGHLIGHT_COST}개 / 보유: {pts}개)", ephemeral=True)
             return
         await interaction.response.send_modal(HighlightModal())
+        await self.close_menu()
 
     @discord.ui.button(label=f"🖼️ 서버 프로필 꾸미기 ({SERVER_DECOR_COST}개)", style=discord.ButtonStyle.blurple)
     async def server_decor_btn(self, interaction: discord.Interaction, button: discord.ui.Button):
@@ -251,6 +267,7 @@ class ShopMainView(discord.ui.View):
             await interaction.response.send_message("⚠️ 봇에게 '서버 관리' 권한이 없어서 사용할 수 없습니다. 관리자에게 문의해주세요.", ephemeral=True)
             return
         await interaction.response.send_modal(ServerDecorModal())
+        await self.close_menu()
 
     @discord.ui.button(label=f"🏷️ 타인 닉네임 1일 교체권 ({NICKNAME_CHANGE_COST}개)", style=discord.ButtonStyle.blurple)
     async def nickname_btn(self, interaction: discord.Interaction, button: discord.ui.Button):
@@ -266,19 +283,23 @@ class ShopMainView(discord.ui.View):
             view=NicknameTargetSelectView(),
             ephemeral=True
         )
+        await self.close_menu()
 
 @bot.tree.command(name="만두집", description="만두로 할 수 있는 것들을 확인합니다 (나만 볼 수 있음)")
 async def 만두집(interaction: discord.Interaction):
     pts = get_points(interaction.user.id)
     embed = discord.Embed(
         title="🥟 만두집 상점",
-        description=f"현재 보유 만두: **{pts}개**\n\n아래 버튼을 눌러 만두를 사용해보세요!",
+        description=f"현재 보유 만두: **{pts}개**\n\n아래 버튼을 눌러 만두를 사용해보세요! (2분간 미사용 시 자동 종료)",
         color=discord.Color.orange()
     )
     embed.add_field(name="✨ 텍스트 강조", value=f"{TEXT_HIGHLIGHT_COST}개 · 원하는 문구를 화려하게 강조해서 채팅에 게시", inline=False)
-    embed.add_field(name="🖼️ 서버 프로필 꾸미기", value=f"{SERVER_DECOR_COST}개 · {TEMP_CHANGE_DURATION}초 동안 서버 이름/아이콘 변경 (이후 자동 복구)", inline=False)
-    embed.add_field(name="🏷️ 타인 닉네임 1일 교체권", value=f"{NICKNAME_CHANGE_COST}개 · 상대 닉네임을 {TEMP_CHANGE_DURATION}초 동안 변경 (이후 자동 복구)", inline=False)
-    await interaction.response.send_message(embed=embed, view=ShopMainView(), ephemeral=True)
+    embed.add_field(name="🖼️ 서버 프로필 꾸미기", value=f"{SERVER_DECOR_COST}개 · 24시간 동안 서버 이름/아이콘 변경 (이후 자동 복구)", inline=False)
+    embed.add_field(name="🏷️ 타인 닉네임 1일 교체권", value=f"{NICKNAME_CHANGE_COST}개 · 상대 닉네임을 24시간 동안 변경 (이후 자동 복구)", inline=False)
+
+    view = ShopMainView()
+    await interaction.response.send_message(embed=embed, view=view, ephemeral=True)
+    view.message = await interaction.original_response()
 
 # ---------- 1. 텍스트 강조 ----------
 class HighlightModal(discord.ui.Modal, title="✨ 텍스트 강조"):
@@ -373,15 +394,25 @@ class ServerDecorModal(discord.ui.Modal, title="🖼️ 서버 프로필 꾸미�
             pass
 
         await interaction.followup.send(
-            f"✅ 서버 프로필이 변경되었습니다! {TEMP_CHANGE_DURATION}초 후 자동으로 원래대로 복구됩니다.",
+            f"✅ 서버 프로필이 변경되었습니다! 24시간 후 자동으로 원래대로 복구됩니다.",
             ephemeral=True
         )
-        await interaction.channel.send(f"🖼️ {interaction.user.mention}님이 만두 {SERVER_DECOR_COST}개로 서버 프로필을 꾸몄습니다! ({TEMP_CHANGE_DURATION}초 후 복구)")
+        await interaction.channel.send(f"🖼️ {interaction.user.mention}님이 만두 {SERVER_DECOR_COST}개로 서버 프로필을 하루 동안 꾸몄습니다!")
 
 # ---------- 3. 타인 닉네임 1일 교체권 (유저 선택 드롭다운 방식) ----------
 class NicknameTargetSelectView(discord.ui.View):
     def __init__(self):
-        super().__init__(timeout=60)
+        super().__init__(timeout=SHOP_MENU_TIMEOUT)
+        self.message = None
+
+    async def on_timeout(self):
+        for item in self.children:
+            item.disabled = True
+        if self.message:
+            try:
+                await self.message.edit(view=self)
+            except discord.HTTPException:
+                pass
 
     @discord.ui.select(cls=discord.ui.UserSelect, placeholder="닉네임을 바꿀 대상을 선택하세요", min_values=1, max_values=1)
     async def select_target(self, interaction: discord.Interaction, select: discord.ui.UserSelect):
@@ -405,6 +436,15 @@ class NicknameTargetSelectView(discord.ui.View):
             return
 
         await interaction.response.send_modal(NicknameChangeModal(member))
+
+        for item in self.children:
+            item.disabled = True
+        if self.message:
+            try:
+                await self.message.edit(view=self)
+            except discord.HTTPException:
+                pass
+        self.stop()
 
 class NicknameChangeModal(discord.ui.Modal, title="🏷️ 새 닉네임 입력"):
     new_nick_input = discord.ui.TextInput(
@@ -445,10 +485,10 @@ class NicknameChangeModal(discord.ui.Modal, title="🏷️ 새 닉네임 입력"
         schedule_temp_change_revert(change_id, expires_at)
 
         await interaction.response.send_message(
-            f"✅ {target.mention}님의 닉네임을 **'{self.new_nick_input.value}'**(으)로 변경했습니다! {TEMP_CHANGE_DURATION}초 후 자동으로 원래대로 복구됩니다.",
+            f"✅ {target.mention}님의 닉네임을 **'{self.new_nick_input.value}'**(으)로 변경했습니다! 24시간 후 자동으로 원래대로 복구됩니다.",
             ephemeral=True
         )
-        await interaction.channel.send(f"🏷️ {interaction.user.mention}님이 만두 {NICKNAME_CHANGE_COST}개로 {target.mention}님의 닉네임을 바꿨습니다! ({TEMP_CHANGE_DURATION}초 후 복구)")
+        await interaction.channel.send(f"🏷️ {interaction.user.mention}님이 만두 {NICKNAME_CHANGE_COST}개로 {target.mention}님의 닉네임을 하루 동안 바꿨습니다!")
 
 # ================= 승부예측 시스템 =================
 async def get_bet_stats(bet_id):
