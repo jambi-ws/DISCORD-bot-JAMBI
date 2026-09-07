@@ -9,7 +9,7 @@ import traceback
 import re
 
 # ---------- 버전 정보 ----------
-BOT_VERSION = "1.3.0"
+BOT_VERSION = "1.3.1"
 
 # ---------- 기본 설정 ----------
 dotenv_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), '.env')
@@ -86,7 +86,7 @@ DURATION_OPTIONS = [
 TEXT_HIGHLIGHT_COST = 100
 SERVER_DECOR_COST = 2000
 NICKNAME_CHANGE_COST = 800
-TEMP_CHANGE_DURATION = 86400  # 24시간
+TEMP_CHANGE_DURATION = 60  # 1분 (테스트용, 원래는 86400=24시간)
 
 def get_points(user_id):
     cur.execute("SELECT points FROM points WHERE user_id=?", (user_id,))
@@ -273,8 +273,8 @@ async def 만두집(interaction: discord.Interaction):
         color=discord.Color.orange()
     )
     embed.add_field(name="✨ 텍스트 강조", value=f"{TEXT_HIGHLIGHT_COST}개 · 원하는 문구를 화려하게 강조해서 채팅에 게시", inline=False)
-    embed.add_field(name="🖼️ 서버 프로필 꾸미기", value=f"{SERVER_DECOR_COST}개 · 24시간 동안 서버 이름/아이콘 변경 (이후 자동 복구)", inline=False)
-    embed.add_field(name="🏷️ 타인 닉네임 1일 교체권", value=f"{NICKNAME_CHANGE_COST}개 · 상대 닉네임을 24시간 동안 변경 (이후 자동 복구)", inline=False)
+    embed.add_field(name="🖼️ 서버 프로필 꾸미기", value=f"{SERVER_DECOR_COST}개 · {TEMP_CHANGE_DURATION}초 동안 서버 이름/아이콘 변경 (이후 자동 복구)", inline=False)
+    embed.add_field(name="🏷️ 타인 닉네임 1일 교체권", value=f"{NICKNAME_CHANGE_COST}개 · 상대 닉네임을 {TEMP_CHANGE_DURATION}초 동안 변경 (이후 자동 복구)", inline=False)
     await interaction.response.send_message(embed=embed, view=ShopMainView(), ephemeral=True)
 
 # ---------- 1. 텍스트 강조 ----------
@@ -370,10 +370,10 @@ class ServerDecorModal(discord.ui.Modal, title="🖼️ 서버 프로필 꾸미�
             pass
 
         await interaction.followup.send(
-            f"✅ 서버 프로필이 변경되었습니다! 24시간 후 자동으로 원래대로 복구됩니다.",
+            f"✅ 서버 프로필이 변경되었습니다! {TEMP_CHANGE_DURATION}초 후 자동으로 원래대로 복구됩니다.",
             ephemeral=True
         )
-        await interaction.channel.send(f"🖼️ {interaction.user.mention}님이 만두 {SERVER_DECOR_COST}개로 서버 프로필을 하루 동안 꾸몄습니다!")
+        await interaction.channel.send(f"🖼️ {interaction.user.mention}님이 만두 {SERVER_DECOR_COST}개로 서버 프로필을 꾸몄습니다! ({TEMP_CHANGE_DURATION}초 후 복구)")
 
 # ---------- 3. 타인 닉네임 1일 교체권 ----------
 class NicknameChangeModal(discord.ui.Modal, title="🏷️ 타인 닉네임 1일 교체권"):
@@ -434,10 +434,10 @@ class NicknameChangeModal(discord.ui.Modal, title="🏷️ 타인 닉네임 1일
         schedule_temp_change_revert(change_id, expires_at)
 
         await interaction.response.send_message(
-            f"✅ {target.mention}님의 닉네임을 **'{self.new_nick_input.value}'**(으)로 변경했습니다! 24시간 후 자동으로 원래대로 복구됩니다.",
+            f"✅ {target.mention}님의 닉네임을 **'{self.new_nick_input.value}'**(으)로 변경했습니다! {TEMP_CHANGE_DURATION}초 후 자동으로 원래대로 복구됩니다.",
             ephemeral=True
         )
-        await interaction.channel.send(f"🏷️ {interaction.user.mention}님이 만두 {NICKNAME_CHANGE_COST}개로 {target.mention}님의 닉네임을 하루 동안 바꿨습니다!")
+        await interaction.channel.send(f"🏷️ {interaction.user.mention}님이 만두 {NICKNAME_CHANGE_COST}개로 {target.mention}님의 닉네임을 바꿨습니다! ({TEMP_CHANGE_DURATION}초 후 복구)")
 
 # ================= 승부예측 시스템 =================
 async def get_bet_stats(bet_id):
