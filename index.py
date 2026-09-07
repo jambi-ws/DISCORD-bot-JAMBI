@@ -8,7 +8,7 @@ import datetime
 import traceback
 
 # ---------- 버전 정보 ----------
-BOT_VERSION = "1.0.0"
+BOT_VERSION = "1.1.0"
 
 # ---------- 기본 설정 ----------
 dotenv_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), '.env')
@@ -28,7 +28,6 @@ cur = conn.cursor()
 cur.execute("""CREATE TABLE IF NOT EXISTS points (
     user_id INTEGER PRIMARY KEY, points INTEGER DEFAULT 0)""")
 
-# bets 테이블 구조 확인 및 마이그레이션
 cur.execute("PRAGMA table_info(bets)")
 existing_columns = [row[1] for row in cur.fetchall()]
 
@@ -42,7 +41,8 @@ if not existing_columns:
         channel_id INTEGER,
         message_id INTEGER,
         created_at INTEGER,
-        creator_id INTEGER)""")
+        creator_id INTEGER,
+        duration_seconds INTEGER DEFAULT 180)""")
 else:
     if "option_a" not in existing_columns:
         cur.execute("ALTER TABLE bets ADD COLUMN option_a TEXT DEFAULT '성공'")
@@ -52,6 +52,8 @@ else:
         cur.execute("ALTER TABLE bets ADD COLUMN created_at INTEGER DEFAULT 0")
     if "creator_id" not in existing_columns:
         cur.execute("ALTER TABLE bets ADD COLUMN creator_id INTEGER DEFAULT 0")
+    if "duration_seconds" not in existing_columns:
+        cur.execute("ALTER TABLE bets ADD COLUMN duration_seconds INTEGER DEFAULT 180")
 
 cur.execute("""CREATE TABLE IF NOT EXISTS wagers (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -61,7 +63,12 @@ cur.execute("""CREATE TABLE IF NOT EXISTS wagers (
     amount INTEGER)""")
 conn.commit()
 
-BETTING_DURATION = 180  # 3분
+DURATION_OPTIONS = [
+    ("15초", 15),
+    ("30초", 30),
+    ("1분", 60),
+    ("3분", 180),
+]
 
 def get_points(user_id):
     cur.execute("SELECT points FROM points WHERE user_id=?", (user_id,))
@@ -115,7 +122,7 @@ async def on_voice_state_update(member, before, after):
     if after.channel is None:
         voice_tracker.pop(member.id, None)
 
-# ---------- 만두 확인 / 전체 (슬래시 명령어 - 나만 보기 유지) ----------
+# ---------- 만두 확인 / 전체 (슬래시 명령어) ----------
 @bot.tree.command(name="만두확인", description="내 만두 개수와 순위를 확인합니다 (나만 볼 수 있음)")
 async def 만두확인(interaction: discord.Interaction):
     pts = get_points(interaction.user.id)
@@ -165,7 +172,7 @@ async def get_bet_stats(bet_id):
         stats[choice] = {"count": count, "total": total or 0}
     return stats
 
-def build_bet_embed(title, option_a, option_b, stats, status, created_at):
+def build_bet_embed(title, option_a, option_b, stats, status, created_at, duration_seconds):
     embed = discord.Embed(title=f"🔮 승부예측: {title}", color=discord.Color.blurple())
     embed.add_field(
         name=f"✅ {option_a}",
@@ -178,9 +185,9 @@ def build_bet_embed(title, option_a, option_b, stats, status, created_at):
         inline=True
     )
     if status == "open":
-        remaining = BETTING_DURATION - (int(time.time()) - created_at)
+        remaining = duration_seconds - (int(time.time()) - created_at)
         if remaining > 0:
-            embed.set_footer(text=f"상태: 진행중 (배팅 마감까지 약 {remaining // 60}분 {remaining % 60}초)")
+            embed.set_footer(text=f"상태: 진행중 (배팅 마감까지 약 {remaining // 60}분 {remaining % 60}초) · 같은 옵션에는 추가 배팅 가능")
         else:
             embed.set_footer(text="상태: 배팅 마감됨 · 결과 발표 대기중")
     elif status == "cancelled":
@@ -191,13 +198,13 @@ def build_bet_embed(title, option_a, option_b, stats, status, created_at):
     return embed
 
 async def refresh_bet_message(bet_id, view=None):
-    cur.execute("SELECT title, option_a, option_b, status, channel_id, message_id, created_at FROM bets WHERE bet_id=?", (bet_id,))
+    cur.execute("SELECT title, option_a, option_b, status, channel_id, message_id, created_at, duration_seconds FROM bets WHERE bet_id=?", (bet_id,))
     row = cur.fetchone()
     if not row:
         return
-    title, option_a, option_b, status, channel_id, message_id, created_at = row
+    title, option_a, option_b, status, channel_id, message_id, created_at, duration_seconds = row
     stats = await get_bet_stats(bet_id)
-    embed = build_bet_embed(title, option_a, option_b, stats, status, created_at)
+    embed = build_bet_embed(title, option_a, option_b, stats, status, created_at, duration_seconds)
 
     channel = bot.get_channel(channel_id)
     if channel and message_id:
@@ -208,9 +215,10 @@ async def refresh_bet_message(bet_id, view=None):
             pass
 
 class BetModal(discord.ui.Modal):
-    def __init__(self, bet_id, choice, option_a_label, option_b_label, current_points):
+    def __init__(self, bet_id, choice, option_a_label, option_b_label, current_points, extra_mode=False):
         label = option_a_label if choice == "a" else option_b_label
-        super().__init__(title=f"'{label}'에 배팅하기")
+        title_text = f"'{label}'에 추가 배팅하기" if extra_mode else f"'{label}'에 배팅하기"
+        super().__init__(title=title_text)
         self.bet_id = bet_id
         self.choice = choice
         self.option_a_label = option_a_label
@@ -223,13 +231,14 @@ class BetModal(discord.ui.Modal):
         self.add_item(self.amount_input)
 
     async def on_submit(self, interaction: discord.Interaction):
-        cur.execute("SELECT status, created_at FROM bets WHERE bet_id=?", (self.bet_id,))
+        cur.execute("SELECT status, created_at, duration_seconds FROM bets WHERE bet_id=?", (self.bet_id,))
         row = cur.fetchone()
         if not row or row[0] != "open":
             await interaction.response.send_message("이 승부예측은 더 이상 참여할 수 없습니다.", ephemeral=True)
             return
-        if int(time.time()) - row[1] > BETTING_DURATION:
-            await interaction.response.send_message("배팅 가능 시간(3분)이 지났습니다.", ephemeral=True)
+        status, created_at, duration_seconds = row
+        if int(time.time()) - created_at > duration_seconds:
+            await interaction.response.send_message("배팅 가능 시간이 지났습니다.", ephemeral=True)
             return
 
         try:
@@ -246,17 +255,32 @@ class BetModal(discord.ui.Modal):
             await interaction.response.send_message(f"만두가 부족합니다. (보유: {user_points}개)", ephemeral=True)
             return
 
-        cur.execute("SELECT amount FROM wagers WHERE bet_id=? AND user_id=?", (self.bet_id, interaction.user.id))
-        if cur.fetchone():
-            await interaction.response.send_message("이미 이 승부예측에 참여하셨습니다.", ephemeral=True)
-            return
+        # 기존 배팅 내역 확인
+        cur.execute("SELECT choice, amount FROM wagers WHERE bet_id=? AND user_id=?", (self.bet_id, interaction.user.id))
+        existing = cur.fetchone()
 
-        add_points(interaction.user.id, -amount)
-        cur.execute("INSERT INTO wagers (bet_id, user_id, choice, amount) VALUES (?, ?, ?, ?)",
-                    (self.bet_id, interaction.user.id, self.choice, amount))
-        conn.commit()
+        if existing:
+            existing_choice, existing_amount = existing
+            if existing_choice != self.choice:
+                existing_label = self.option_a_label if existing_choice == "a" else self.option_b_label
+                await interaction.response.send_message(
+                    f"이미 **'{existing_label}'**에 배팅하셨습니다. 반대쪽에는 배팅할 수 없습니다. (같은 쪽에는 추가 배팅 가능)",
+                    ephemeral=True
+                )
+                return
+            # 같은 옵션 → 추가 배팅 (합산)
+            add_points(interaction.user.id, -amount)
+            cur.execute("UPDATE wagers SET amount = amount + ? WHERE bet_id=? AND user_id=?", (amount, self.bet_id, interaction.user.id))
+            conn.commit()
+            new_total = existing_amount + amount
+            await interaction.response.send_message(f"만두 {amount}개를 추가로 배팅했습니다! (이 승부예측 총 배팅: {new_total}개)", ephemeral=True)
+        else:
+            add_points(interaction.user.id, -amount)
+            cur.execute("INSERT INTO wagers (bet_id, user_id, choice, amount) VALUES (?, ?, ?, ?)",
+                        (self.bet_id, interaction.user.id, self.choice, amount))
+            conn.commit()
+            await interaction.response.send_message(f"만두 {amount}개를 배팅했습니다!", ephemeral=True)
 
-        await interaction.response.send_message(f"만두 {amount}개를 배팅했습니다!", ephemeral=True)
         await refresh_bet_message(self.bet_id, view=BetView(self.bet_id, self.option_a_label, self.option_b_label))
 
 class BetView(discord.ui.View):
@@ -269,12 +293,24 @@ class BetView(discord.ui.View):
 
         async def on_a(interaction: discord.Interaction):
             current_points = get_points(interaction.user.id)
-            modal = BetModal(bet_id, "a", option_a, option_b, current_points)
+            cur.execute("SELECT choice FROM wagers WHERE bet_id=? AND user_id=?", (bet_id, interaction.user.id))
+            existing = cur.fetchone()
+            extra_mode = bool(existing and existing[0] == "a")
+            if existing and existing[0] == "b":
+                await interaction.response.send_message(f"이미 **'{option_b}'**에 배팅하셨습니다. 반대쪽에는 배팅할 수 없습니다.", ephemeral=True)
+                return
+            modal = BetModal(bet_id, "a", option_a, option_b, current_points, extra_mode=extra_mode)
             await interaction.response.send_modal(modal)
 
         async def on_b(interaction: discord.Interaction):
             current_points = get_points(interaction.user.id)
-            modal = BetModal(bet_id, "b", option_a, option_b, current_points)
+            cur.execute("SELECT choice FROM wagers WHERE bet_id=? AND user_id=?", (bet_id, interaction.user.id))
+            existing = cur.fetchone()
+            extra_mode = bool(existing and existing[0] == "b")
+            if existing and existing[0] == "a":
+                await interaction.response.send_message(f"이미 **'{option_a}'**에 배팅하셨습니다. 반대쪽에는 배팅할 수 없습니다.", ephemeral=True)
+                return
+            modal = BetModal(bet_id, "b", option_a, option_b, current_points, extra_mode=extra_mode)
             await interaction.response.send_modal(modal)
 
         btn_a.callback = on_a
@@ -282,19 +318,70 @@ class BetView(discord.ui.View):
         self.add_item(btn_a)
         self.add_item(btn_b)
 
-async def close_betting_after_delay(bet_id):
-    await discord.utils.sleep_until(discord.utils.utcnow() + datetime.timedelta(seconds=BETTING_DURATION))
+async def close_betting_after_delay(bet_id, duration_seconds):
+    await discord.utils.sleep_until(discord.utils.utcnow() + datetime.timedelta(seconds=duration_seconds))
     cur.execute("SELECT status FROM bets WHERE bet_id=?", (bet_id,))
     row = cur.fetchone()
     if row and row[0] == "open":
         await refresh_bet_message(bet_id, view=None)
+
+# ---------- 승부예측 생성: 제한시간 선택 화면 ----------
+class DurationSelectView(discord.ui.View):
+    def __init__(self, creator_id, channel_id, title, option_a, option_b):
+        super().__init__(timeout=60)
+        self.creator_id = creator_id
+        self.channel_id = channel_id
+        self.title_text = title
+        self.option_a = option_a
+        self.option_b = option_b
+
+        for label, seconds in DURATION_OPTIONS:
+            btn = discord.ui.Button(label=label, style=discord.ButtonStyle.blurple)
+
+            async def callback(interaction: discord.Interaction, seconds=seconds, label=label):
+                if interaction.user.id != self.creator_id:
+                    await interaction.response.send_message("이 승부예측을 만든 본인만 제한시간을 선택할 수 있습니다.", ephemeral=True)
+                    return
+
+                cur.execute("SELECT bet_id FROM bets WHERE status='open'")
+                if cur.fetchone():
+                    await interaction.response.send_message("이미 다른 승부예측이 먼저 시작되었습니다. 이 예측은 생성되지 않습니다.", ephemeral=True)
+                    self.stop()
+                    return
+
+                created_at = int(time.time())
+                cur.execute(
+                    "INSERT INTO bets (title, option_a, option_b, status, channel_id, created_at, creator_id, duration_seconds) VALUES (?, ?, ?, 'open', ?, ?, ?, ?)",
+                    (self.title_text, self.option_a, self.option_b, self.channel_id, created_at, self.creator_id, seconds)
+                )
+                conn.commit()
+                bet_id = cur.lastrowid
+
+                stats = {"a": {"count": 0, "total": 0}, "b": {"count": 0, "total": 0}}
+                embed = build_bet_embed(self.title_text, self.option_a, self.option_b, stats, "open", created_at, seconds)
+                bet_view = BetView(bet_id, self.option_a, self.option_b)
+
+                await interaction.response.edit_message(
+                    content=f"✅ 제한시간 **{label}**으로 승부예측이 생성되었습니다!",
+                    embed=None, view=None
+                )
+                channel = bot.get_channel(self.channel_id)
+                msg = await channel.send(embed=embed, view=bet_view)
+                cur.execute("UPDATE bets SET message_id=? WHERE bet_id=?", (msg.id, bet_id))
+                conn.commit()
+
+                bot.loop.create_task(close_betting_after_delay(bet_id, seconds))
+                self.stop()
+
+            btn.callback = callback
+            self.add_item(btn)
 
 # ---------- 승부예측 생성 / 종료 / 상태 ----------
 @bot.group(invoke_without_command=True)
 async def 승부예측(ctx):
     await ctx.send(
         '사용법:\n'
-        '`!승부예측 생성 "제목" "성공옵션" "실패옵션"`\n'
+        '`!승부예측 생성 "제목" "성공옵션" "실패옵션"` (제한시간은 이후 버튼으로 선택)\n'
         '`!승부예측 종료 결과` (생성한 본인만 가능)\n'
         '`!승부예측 전체종료` (관리자 전용, 누가 만들었든 취소 가능)\n'
         '`!승부예측 상태` (디버깅용: 현재 상태 확인)'
@@ -302,12 +389,12 @@ async def 승부예측(ctx):
 
 @승부예측.command(name="상태")
 async def 승부예측_상태(ctx):
-    cur.execute("SELECT bet_id, title, option_a, option_b, status, created_at, creator_id FROM bets ORDER BY bet_id DESC LIMIT 1")
+    cur.execute("SELECT bet_id, title, option_a, option_b, status, created_at, creator_id, duration_seconds FROM bets ORDER BY bet_id DESC LIMIT 1")
     row = cur.fetchone()
     if not row:
         await ctx.send("아직 생성된 승부예측 기록이 전혀 없습니다.")
         return
-    bet_id, title, option_a, option_b, status, created_at, creator_id = row
+    bet_id, title, option_a, option_b, status, created_at, creator_id, duration_seconds = row
     creator = ctx.guild.get_member(creator_id)
     creator_name = creator.display_name if creator else str(creator_id)
     await ctx.send(
@@ -317,6 +404,7 @@ async def 승부예측_상태(ctx):
         f"- 옵션: {option_a} / {option_b}\n"
         f"- 상태: {status}\n"
         f"- 생성자: {creator_name}\n"
+        f"- 제한시간: {duration_seconds}초\n"
         f"- 생성 시각(유닉스): {created_at}"
     )
 
@@ -329,24 +417,11 @@ async def 승부예측_생성(ctx, 제목: str, 성공옵션: str, 실패옵션:
             await ctx.send(f"이미 진행 중인 승부예측이 있습니다 (ID: {existing[0]}, 제목: {existing[1]}). 먼저 종료해주세요.")
             return
 
-        created_at = int(time.time())
-        cur.execute(
-            "INSERT INTO bets (title, option_a, option_b, status, channel_id, created_at, creator_id) VALUES (?, ?, ?, 'open', ?, ?, ?)",
-            (제목, 성공옵션, 실패옵션, ctx.channel.id, created_at, ctx.author.id)
+        view = DurationSelectView(ctx.author.id, ctx.channel.id, 제목, 성공옵션, 실패옵션)
+        await ctx.send(
+            f"🔮 **{제목}** ('{성공옵션}' vs '{실패옵션}')\n배팅 제한시간을 선택해주세요 (본인만 선택 가능):",
+            view=view
         )
-        conn.commit()
-        bet_id = cur.lastrowid
-
-        stats = {"a": {"count": 0, "total": 0}, "b": {"count": 0, "total": 0}}
-        embed = build_bet_embed(제목, 성공옵션, 실패옵션, stats, "open", created_at)
-        view = BetView(bet_id, 성공옵션, 실패옵션)
-
-        msg = await ctx.send(embed=embed, view=view)
-        cur.execute("UPDATE bets SET message_id=? WHERE bet_id=?", (msg.id, bet_id))
-        conn.commit()
-
-        bot.loop.create_task(close_betting_after_delay(bet_id))
-        print(f"[승부예측 생성 성공] ID={bet_id}, 제목={제목}, 생성자={ctx.author.id}")
     except Exception as e:
         error_text = traceback.format_exc()
         print(f"[승부예측 생성 오류]\n{error_text}")
@@ -446,14 +521,14 @@ async def on_ready():
     if not voice_point_task.is_running():
         voice_point_task.start()
 
-    cur.execute("SELECT bet_id, option_a, option_b, status, created_at FROM bets WHERE status='open'")
+    cur.execute("SELECT bet_id, option_a, option_b, status, created_at, duration_seconds FROM bets WHERE status='open'")
     row = cur.fetchone()
     if row:
-        bet_id, option_a, option_b, status, created_at = row
-        remaining = BETTING_DURATION - (int(time.time()) - created_at)
+        bet_id, option_a, option_b, status, created_at, duration_seconds = row
+        remaining = duration_seconds - (int(time.time()) - created_at)
         if remaining > 0:
             bot.add_view(BetView(bet_id, option_a, option_b))
-            bot.loop.create_task(close_betting_after_delay(bet_id))
+            bot.loop.create_task(close_betting_after_delay(bet_id, duration_seconds))
 
     try:
         synced = await bot.tree.sync()
