@@ -8,7 +8,7 @@ import datetime
 import traceback
 
 # ---------- 버전 정보 ----------
-BOT_VERSION = "1.4.0"
+BOT_VERSION = "1.5.0"
 
 # ---------- 기본 설정 ----------
 dotenv_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), '.env')
@@ -88,6 +88,19 @@ NICKNAME_CHANGE_COST = 4000
 TEMP_CHANGE_DURATION = 86400  # 24시간
 SHOP_MENU_TIMEOUT = 120  # 2분
 
+# ---------- 음성 채널 인원수 보너스 설정 ----------
+def get_headcount_bonus(headcount):
+    if headcount >= 10:
+        return 20
+    elif headcount >= 6:
+        return 15
+    elif headcount >= 4:
+        return 10
+    elif headcount >= 3:
+        return 5
+    else:
+        return 0
+
 def get_points(user_id):
     cur.execute("SELECT points FROM points WHERE user_id=?", (user_id,))
     row = cur.fetchone()
@@ -122,14 +135,17 @@ voice_tracker = {}
 async def voice_point_task():
     for guild in bot.guilds:
         for vc in guild.voice_channels:
-            for member in vc.members:
-                if member.bot:
-                    continue
+            human_members = [m for m in vc.members if not m.bot]
+            headcount = len(human_members)
+            bonus = get_headcount_bonus(headcount)
+
+            for member in human_members:
                 uid = member.id
                 voice_tracker[uid] = voice_tracker.get(uid, 0) + 60
                 elapsed = voice_tracker[uid]
+
                 if elapsed % 600 == 0:
-                    add_points(uid, 20)
+                    add_points(uid, 20 + bonus)
                 if elapsed % 3600 == 0:
                     add_points(uid, 10)
 
